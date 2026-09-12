@@ -19,6 +19,7 @@ ENV_FILE = Path("/etc/nissan-soc-mqtt.env")
 MQTT_HOST = "localhost"
 MQTT_PORT = 1883
 SOC_TOPIC = "home/ev/mammabim/soc_percent"
+CHARGING_TOPIC = "home/ev/mammabim/charging"
 
 EVENT_TOPIC = "home/ev/control/event"
 EV_METER_TOPIC = "home/ev/meter/status/em:0"
@@ -204,6 +205,12 @@ class App:
 
         return plug_status, charge_status
 
+    def publish_retained(self, topic: str, payload: str) -> None:
+        result = self.mqtt.publish(topic, payload, qos=1, retain=True)
+        result.wait_for_publish(timeout=10)
+        if result.rc != mqtt.MQTT_ERR_SUCCESS:
+            raise RuntimeError(f"MQTT publish failed for {topic}: {result.rc}")
+
     def fetch_and_publish(self, reason: str) -> bool:
         try:
             if self.vehicle is None:
@@ -215,18 +222,17 @@ class App:
                 raise RuntimeError("batteryLevel missing from Nissan response")
 
             plug_status, charge_status = self.update_api_state(status)
+            charge_label = self.charge_label(charge_status)
 
-            result = self.mqtt.publish(SOC_TOPIC, str(soc), qos=1, retain=True)
-            result.wait_for_publish(timeout=10)
-            if result.rc != mqtt.MQTT_ERR_SUCCESS:
-                raise RuntimeError(f"MQTT publish failed: {result.rc}")
+            self.publish_retained(SOC_TOPIC, str(soc))
+            self.publish_retained(CHARGING_TOPIC, charge_label)
 
             updated = self.nissan_timestamp(status)
             LOG.info(
                 "SoC=%s%% plugged=%s charging=%s Nissan_updated=%s reason=%s",
                 soc,
                 self.plug_label(plug_status),
-                self.charge_label(charge_status),
+                charge_label,
                 updated or "unknown",
                 reason,
             )
