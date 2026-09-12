@@ -20,9 +20,7 @@ MQTT_HOST = "localhost"
 MQTT_PORT = 1883
 SOC_TOPIC = "home/ev/mammabim/soc_percent"
 CHARGING_TOPIC = "home/ev/mammabim/charging"
-PLUGGED_TOPIC = "home/ev/mammabim/plugged"
 
-EVENT_TOPIC = "home/ev/control/event"
 EV_METER_TOPIC = "home/ev/meter/status/em:0"
 
 # Keep this aligned with EV_LOW_POWER_THRESHOLD_W in Solis_controller.
@@ -30,8 +28,6 @@ CHARGING_POWER_THRESHOLD_W = 50.0
 
 HOURLY_POLL_SECONDS = 60 * 60
 CHARGING_POLL_SECONDS = 5 * 60
-DISCOVERY_POLL_SECONDS = 5 * 60
-DISCOVERY_FOLLOWUP_POLLS = 3  # arrived immediately, then +5, +10, +15 min
 INITIAL_MQTT_SYNC_SECONDS = 2
 
 logging.basicConfig(
@@ -70,9 +66,8 @@ class App:
 
         self.state_lock = threading.Lock()
         self.ev_power_w: float | None = None
-        self.plugged_candidate = False
+        self.api_charging = False
         self.ready = False
-        self.was_charging = False
         self.events: queue.Queue[str] = queue.Queue()
 
         try:
@@ -89,57 +84,23 @@ class App:
             return
 
         LOG.info("Connected to MQTT broker")
-        client.subscribe(
-            [
-                (EVENT_TOPIC, 0),
-                (EV_METER_TOPIC, 0),
-            ]
-        )
+        client.subscribe(EV_METER_TOPIC)
 
-    def is_charging_locked(self) -> bool:
+    def meter_charging_locked(self) -> bool:
         return bool(
-            self.plugged_candidate
-            and self.ev_power_w is not None
+            self.ev_power_w is not None
             and self.ev_power_w > CHARGING_POWER_THRESHOLD_W
         )
 
-    def is_charging(self) -> bool:
+    def should_fast_poll(self) -> bool:
         with self.state_lock:
-            return self.is_charging_locked()
-
-    def update_charging_transition_locked(self) -> tuple[bool, bool]:
-        charging = self.is_charging_locked()
-        previous = self.was_charging
-        if self.ready:
-            self.was_charging = charging
-        return previous, charging
-
-    def handle_charging_transition(self, previous: bool, charging: bool) -> None:
-        if not self.ready or charging == previous:
-            return
-
-        if charging:
-            LOG.info(
-                "Mammabim charging started (API plugged=yes, power=%.1f W)",
-                self.ev_power_w if self.ev_power_w is not None else -1.0,
-            )
-            self.events.put("charging_started")
-        else:
-            LOG.info("Mammabim charging stopped")
-            self.events.put("charging_stopped")
+            return self.meter_charging_locked() and self.api_charging
 
     def on_message(self, client, userdata, msg):
-        payload = msg.payload.decode("utf-8", errors="replace").strip()
-
-        if msg.topic == EVENT_TOPIC:
-            if payload == "arrived" and self.ready:
-                LOG.info("Arrival event received; starting 15-minute Nissan discovery")
-                self.events.put("arrived")
-            return
-
         if msg.topic != EV_METER_TOPIC:
             return
 
+        payload = msg.payload.decode("utf-8", errors="replace").strip()
         try:
             data = json.loads(payload)
             value = data.get("total_act_power")
@@ -149,9 +110,23 @@ class App:
             return
 
         with self.state_lock:
+            previous_meter_charging = self.meter_charging_locked()
             self.ev_power_w = power_w
-            previous, charging = self.update_charging_transition_locked()
-        self.handle_charging_transition(previous, charging)
+            meter_charging = self.meter_charging_locked()
+            ready = self.ready
+
+        if not ready or meter_charging == previous_meter_charging:
+            return
+
+        if meter_charging:
+            LOG.info(
+                "EV meter charging started, power=%.1f W; polling Nissan",
+                power_w if power_w is not None else -1.0,
+            )
+            self.events.put("meter_charging_started")
+        else:
+            LOG.info("EV meter charging stopped; polling Nissan")
+            self.events.put("meter_charging_stopped")
 
     def connect_nissan(self) -> None:
         LOG.info("Logging in to Nissan")
@@ -185,27 +160,6 @@ class App:
     def charge_label(value) -> str:
         return {0: "NOT_CHARGING", 1: "CHARGING"}.get(value, f"UNKNOWN({value})")
 
-    def update_api_state(self, status: dict) -> tuple[object, object]:
-        plug_status = status.get("plugStatus")
-        charge_status = status.get("chargeStatus")
-
-        # Charging necessarily implies a connected car. Otherwise trust plugStatus
-        # when Nissan supplied a known value.
-        if charge_status == 1:
-            plugged = True
-        elif plug_status in (0, 1):
-            plugged = plug_status == 1
-        else:
-            plugged = None
-
-        if plugged is not None:
-            with self.state_lock:
-                self.plugged_candidate = plugged
-                previous, charging = self.update_charging_transition_locked()
-            self.handle_charging_transition(previous, charging)
-
-        return plug_status, charge_status
-
     def publish_retained(self, topic: str, payload: str) -> None:
         result = self.mqtt.publish(topic, payload, qos=1, retain=True)
         result.wait_for_publish(timeout=10)
@@ -222,13 +176,16 @@ class App:
             if soc is None:
                 raise RuntimeError("batteryLevel missing from Nissan response")
 
-            plug_status, charge_status = self.update_api_state(status)
+            plug_status = status.get("plugStatus")
+            charge_status = status.get("chargeStatus")
             plug_label = self.plug_label(plug_status)
             charge_label = self.charge_label(charge_status)
 
+            with self.state_lock:
+                self.api_charging = charge_status == 1
+
             self.publish_retained(SOC_TOPIC, str(soc))
             self.publish_retained(CHARGING_TOPIC, charge_label)
-            self.publish_retained(PLUGGED_TOPIC, plug_label)
 
             updated = self.nissan_timestamp(status)
             LOG.info(
@@ -241,71 +198,53 @@ class App:
             )
             return True
         except Exception:
-            LOG.exception("SoC fetch failed, reason=%s", reason)
+            LOG.exception("Nissan fetch failed, reason=%s", reason)
             return False
 
     def run(self) -> None:
         self.mqtt.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
         self.mqtt.loop_start()
 
-        discovery_remaining = 0
-        next_discovery_at: float | None = None
-
         try:
             time.sleep(INITIAL_MQTT_SYNC_SECONDS)
             with self.state_lock:
                 self.ready = True
                 power_w = self.ev_power_w
+                meter_charging = self.meter_charging_locked()
 
             LOG.info(
                 "Initial MQTT state synced, power=%s",
                 f"{power_w:.1f} W" if power_w is not None else "unknown",
             )
 
-            self.fetch_and_publish("startup")
+            # Startup fetch gives Home Assistant current SoC/status. If charging is
+            # already in progress, this same fetch also identifies Mammabim.
+            self.fetch_and_publish("startup_charging" if meter_charging else "startup")
 
             while True:
-                normal_interval = (
-                    CHARGING_POLL_SECONDS if self.is_charging() else HOURLY_POLL_SECONDS
+                timeout = (
+                    CHARGING_POLL_SECONDS
+                    if self.should_fast_poll()
+                    else HOURLY_POLL_SECONDS
                 )
-                timeout = normal_interval
-
-                if next_discovery_at is not None:
-                    timeout = min(timeout, max(0.0, next_discovery_at - time.monotonic()))
 
                 try:
                     reason = self.events.get(timeout=timeout)
                 except queue.Empty:
-                    if next_discovery_at is not None and time.monotonic() >= next_discovery_at:
-                        reason = "arrival_discovery"
-                    else:
-                        reason = "scheduled_charging" if self.is_charging() else "scheduled_hourly"
+                    reason = (
+                        "scheduled_charging"
+                        if self.should_fast_poll()
+                        else "scheduled_hourly"
+                    )
 
-                if reason == "charging_stopped":
-                    continue
-
-                if reason == "arrived":
-                    discovery_remaining = DISCOVERY_FOLLOWUP_POLLS
-                    next_discovery_at = time.monotonic() + DISCOVERY_POLL_SECONDS
-                elif reason == "arrival_discovery":
-                    discovery_remaining -= 1
-                    if discovery_remaining > 0:
-                        next_discovery_at = time.monotonic() + DISCOVERY_POLL_SECONDS
-                    else:
-                        next_discovery_at = None
-
-                # Collapse duplicate immediate triggers already waiting in the queue.
+                # Multiple rapid meter transitions (for example from clouds) do not
+                # need one API request per queued edge. One fresh poll is enough.
                 while True:
                     try:
                         pending = self.events.get_nowait()
                     except queue.Empty:
                         break
-                    if pending == "arrived":
-                        discovery_remaining = DISCOVERY_FOLLOWUP_POLLS
-                        next_discovery_at = time.monotonic() + DISCOVERY_POLL_SECONDS
-                        reason = f"{reason}+arrived"
-                    elif pending != "charging_stopped":
-                        reason = f"{reason}+{pending}"
+                    reason = f"{reason}+{pending}"
 
                 self.fetch_and_publish(reason)
         finally:
