@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import queue
@@ -21,10 +22,13 @@ CAR_NAME = "Mammabim"
 SOC_TOPIC = "home/ev/mammabim/soc_percent"
 
 EVENT_TOPIC = "home/ev/control/event"
+ACTIVE_CANDIDATE_TOPIC = "home/ev/control/active_candidate"
 GARAGE_CAR_TOPIC = "home/ev/garage/car"
-GARAGE_STATUS_TOPIC = "home/ev/garage/status"
 CARPORT_CAR_TOPIC = "home/ev/carport/car"
-CARPORT_STATUS_TOPIC = "home/ev/carport/status"
+EV_METER_TOPIC = "home/ev/meter/status/em:0"
+
+# Keep this aligned with EV_LOW_POWER_THRESHOLD_W in Solis_controller.
+CHARGING_POWER_THRESHOLD_W = 50.0
 
 HOURLY_POLL_SECONDS = 60 * 60
 CHARGING_POLL_SECONDS = 5 * 60
@@ -66,11 +70,11 @@ class App:
 
         self.state_lock = threading.Lock()
         self.state = {
+            ACTIVE_CANDIDATE_TOPIC: None,
             GARAGE_CAR_TOPIC: None,
-            GARAGE_STATUS_TOPIC: None,
             CARPORT_CAR_TOPIC: None,
-            CARPORT_STATUS_TOPIC: None,
         }
+        self.ev_power_w: float | None = None
         self.ready = False
         self.was_charging = False
         self.events: queue.Queue[str] = queue.Queue()
@@ -92,25 +96,54 @@ class App:
         client.subscribe(
             [
                 (EVENT_TOPIC, 0),
+                (ACTIVE_CANDIDATE_TOPIC, 0),
                 (GARAGE_CAR_TOPIC, 0),
-                (GARAGE_STATUS_TOPIC, 0),
                 (CARPORT_CAR_TOPIC, 0),
-                (CARPORT_STATUS_TOPIC, 0),
+                (EV_METER_TOPIC, 0),
             ]
         )
 
+    def selected_car_locked(self) -> str | None:
+        candidate = self.state[ACTIVE_CANDIDATE_TOPIC]
+        if candidate == "charger1":
+            return self.state[GARAGE_CAR_TOPIC]
+        if candidate == "charger2":
+            return self.state[CARPORT_CAR_TOPIC]
+        return None
+
     def is_charging_locked(self) -> bool:
-        return (
-            self.state[GARAGE_CAR_TOPIC] == CAR_NAME
-            and self.state[GARAGE_STATUS_TOPIC] == "in_progress"
-        ) or (
-            self.state[CARPORT_CAR_TOPIC] == CAR_NAME
-            and self.state[CARPORT_STATUS_TOPIC] == "in_progress"
+        return bool(
+            self.ev_power_w is not None
+            and self.ev_power_w > CHARGING_POWER_THRESHOLD_W
+            and self.selected_car_locked() == CAR_NAME
         )
 
     def is_charging(self) -> bool:
         with self.state_lock:
             return self.is_charging_locked()
+
+    def update_charging_transition_locked(self) -> tuple[bool, bool]:
+        charging = self.is_charging_locked()
+        previous = self.was_charging
+        if self.ready:
+            self.was_charging = charging
+        return previous, charging
+
+    def handle_charging_transition(self, previous: bool, charging: bool) -> None:
+        if not self.ready or charging == previous:
+            return
+
+        if charging:
+            LOG.info(
+                "%s charging started (candidate=%s power=%.1f W)",
+                CAR_NAME,
+                self.state[ACTIVE_CANDIDATE_TOPIC],
+                self.ev_power_w if self.ev_power_w is not None else -1.0,
+            )
+            self.events.put("charging_started")
+        else:
+            LOG.info("%s charging stopped", CAR_NAME)
+            self.events.put("charging_stopped")
 
     def on_message(self, client, userdata, msg):
         payload = msg.payload.decode("utf-8", errors="replace").strip()
@@ -121,25 +154,28 @@ class App:
                 self.events.put("arrived")
             return
 
+        if msg.topic == EV_METER_TOPIC:
+            try:
+                data = json.loads(payload)
+                value = data.get("total_act_power")
+                power_w = float(value) if value is not None else None
+            except (ValueError, TypeError, json.JSONDecodeError):
+                LOG.warning("Invalid EV meter payload")
+                return
+
+            with self.state_lock:
+                self.ev_power_w = power_w
+                previous, charging = self.update_charging_transition_locked()
+            self.handle_charging_transition(previous, charging)
+            return
+
         if msg.topic not in self.state:
             return
 
         with self.state_lock:
             self.state[msg.topic] = payload
-            charging = self.is_charging_locked()
-            previous = self.was_charging
-            if self.ready:
-                self.was_charging = charging
-
-        if not self.ready or charging == previous:
-            return
-
-        if charging:
-            LOG.info("%s charging started", CAR_NAME)
-            self.events.put("charging_started")
-        else:
-            LOG.info("%s charging stopped", CAR_NAME)
-            self.events.put("charging_stopped")
+            previous, charging = self.update_charging_transition_locked()
+        self.handle_charging_transition(previous, charging)
 
     def connect_nissan(self) -> None:
         LOG.info("Logging in to Nissan")
@@ -200,10 +236,16 @@ class App:
                 self.was_charging = self.is_charging_locked()
                 self.ready = True
                 charging = self.was_charging
+                candidate = self.state[ACTIVE_CANDIDATE_TOPIC]
+                selected_car = self.selected_car_locked()
+                power_w = self.ev_power_w
 
             LOG.info(
-                "Initial MQTT state synced, charging=%s",
+                "Initial MQTT state synced, charging=%s candidate=%s car=%s power=%s",
                 "yes" if charging else "no",
+                candidate or "none",
+                selected_car or "none",
+                f"{power_w:.1f} W" if power_w is not None else "unknown",
             )
 
             self.fetch_and_publish("startup")
