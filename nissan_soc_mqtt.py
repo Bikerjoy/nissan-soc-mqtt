@@ -18,13 +18,9 @@ ENV_FILE = Path("/etc/nissan-soc-mqtt.env")
 
 MQTT_HOST = "localhost"
 MQTT_PORT = 1883
-CAR_NAME = "Mammabim"
 SOC_TOPIC = "home/ev/mammabim/soc_percent"
 
 EVENT_TOPIC = "home/ev/control/event"
-ACTIVE_CANDIDATE_TOPIC = "home/ev/control/active_candidate"
-GARAGE_CAR_TOPIC = "home/ev/garage/car"
-CARPORT_CAR_TOPIC = "home/ev/carport/car"
 EV_METER_TOPIC = "home/ev/meter/status/em:0"
 
 # Keep this aligned with EV_LOW_POWER_THRESHOLD_W in Solis_controller.
@@ -32,6 +28,8 @@ CHARGING_POWER_THRESHOLD_W = 50.0
 
 HOURLY_POLL_SECONDS = 60 * 60
 CHARGING_POLL_SECONDS = 5 * 60
+DISCOVERY_POLL_SECONDS = 5 * 60
+DISCOVERY_FOLLOWUP_POLLS = 3  # arrived immediately, then +5, +10, +15 min
 INITIAL_MQTT_SYNC_SECONDS = 2
 
 logging.basicConfig(
@@ -69,12 +67,8 @@ class App:
         self.vehicle = None
 
         self.state_lock = threading.Lock()
-        self.state = {
-            ACTIVE_CANDIDATE_TOPIC: None,
-            GARAGE_CAR_TOPIC: None,
-            CARPORT_CAR_TOPIC: None,
-        }
         self.ev_power_w: float | None = None
+        self.plugged_candidate = False
         self.ready = False
         self.was_charging = False
         self.events: queue.Queue[str] = queue.Queue()
@@ -96,26 +90,15 @@ class App:
         client.subscribe(
             [
                 (EVENT_TOPIC, 0),
-                (ACTIVE_CANDIDATE_TOPIC, 0),
-                (GARAGE_CAR_TOPIC, 0),
-                (CARPORT_CAR_TOPIC, 0),
                 (EV_METER_TOPIC, 0),
             ]
         )
 
-    def selected_car_locked(self) -> str | None:
-        candidate = self.state[ACTIVE_CANDIDATE_TOPIC]
-        if candidate == "charger1":
-            return self.state[GARAGE_CAR_TOPIC]
-        if candidate == "charger2":
-            return self.state[CARPORT_CAR_TOPIC]
-        return None
-
     def is_charging_locked(self) -> bool:
         return bool(
-            self.ev_power_w is not None
+            self.plugged_candidate
+            and self.ev_power_w is not None
             and self.ev_power_w > CHARGING_POWER_THRESHOLD_W
-            and self.selected_car_locked() == CAR_NAME
         )
 
     def is_charging(self) -> bool:
@@ -135,14 +118,12 @@ class App:
 
         if charging:
             LOG.info(
-                "%s charging started (candidate=%s power=%.1f W)",
-                CAR_NAME,
-                self.state[ACTIVE_CANDIDATE_TOPIC],
+                "Mammabim charging started (API plugged=yes, power=%.1f W)",
                 self.ev_power_w if self.ev_power_w is not None else -1.0,
             )
             self.events.put("charging_started")
         else:
-            LOG.info("%s charging stopped", CAR_NAME)
+            LOG.info("Mammabim charging stopped")
             self.events.put("charging_stopped")
 
     def on_message(self, client, userdata, msg):
@@ -150,30 +131,23 @@ class App:
 
         if msg.topic == EVENT_TOPIC:
             if payload == "arrived" and self.ready:
-                LOG.info("Arrival event received")
+                LOG.info("Arrival event received; starting 15-minute Nissan discovery")
                 self.events.put("arrived")
             return
 
-        if msg.topic == EV_METER_TOPIC:
-            try:
-                data = json.loads(payload)
-                value = data.get("total_act_power")
-                power_w = float(value) if value is not None else None
-            except (ValueError, TypeError, json.JSONDecodeError):
-                LOG.warning("Invalid EV meter payload")
-                return
-
-            with self.state_lock:
-                self.ev_power_w = power_w
-                previous, charging = self.update_charging_transition_locked()
-            self.handle_charging_transition(previous, charging)
+        if msg.topic != EV_METER_TOPIC:
             return
 
-        if msg.topic not in self.state:
+        try:
+            data = json.loads(payload)
+            value = data.get("total_act_power")
+            power_w = float(value) if value is not None else None
+        except (ValueError, TypeError, json.JSONDecodeError):
+            LOG.warning("Invalid EV meter payload")
             return
 
         with self.state_lock:
-            self.state[msg.topic] = payload
+            self.ev_power_w = power_w
             previous, charging = self.update_charging_transition_locked()
         self.handle_charging_transition(previous, charging)
 
@@ -201,6 +175,35 @@ class App:
                 return value
         return None
 
+    @staticmethod
+    def plug_label(value) -> str:
+        return {0: "NOT_PLUGGED", 1: "PLUGGED"}.get(value, f"UNKNOWN({value})")
+
+    @staticmethod
+    def charge_label(value) -> str:
+        return {0: "NOT_CHARGING", 1: "CHARGING"}.get(value, f"UNKNOWN({value})")
+
+    def update_api_state(self, status: dict) -> tuple[object, object]:
+        plug_status = status.get("plugStatus")
+        charge_status = status.get("chargeStatus")
+
+        # Charging necessarily implies a connected car. Otherwise trust plugStatus
+        # when Nissan supplied a known value.
+        if charge_status == 1:
+            plugged = True
+        elif plug_status in (0, 1):
+            plugged = plug_status == 1
+        else:
+            plugged = None
+
+        if plugged is not None:
+            with self.state_lock:
+                self.plugged_candidate = plugged
+                previous, charging = self.update_charging_transition_locked()
+            self.handle_charging_transition(previous, charging)
+
+        return plug_status, charge_status
+
     def fetch_and_publish(self, reason: str) -> bool:
         try:
             if self.vehicle is None:
@@ -211,16 +214,22 @@ class App:
             if soc is None:
                 raise RuntimeError("batteryLevel missing from Nissan response")
 
+            plug_status, charge_status = self.update_api_state(status)
+
             result = self.mqtt.publish(SOC_TOPIC, str(soc), qos=1, retain=True)
             result.wait_for_publish(timeout=10)
             if result.rc != mqtt.MQTT_ERR_SUCCESS:
                 raise RuntimeError(f"MQTT publish failed: {result.rc}")
 
             updated = self.nissan_timestamp(status)
-            if updated:
-                LOG.info("SoC=%s%% Nissan_updated=%s reason=%s", soc, updated, reason)
-            else:
-                LOG.info("SoC=%s%% reason=%s", soc, reason)
+            LOG.info(
+                "SoC=%s%% plugged=%s charging=%s Nissan_updated=%s reason=%s",
+                soc,
+                self.plug_label(plug_status),
+                self.charge_label(charge_status),
+                updated or "unknown",
+                reason,
+            )
             return True
         except Exception:
             LOG.exception("SoC fetch failed, reason=%s", reason)
@@ -230,38 +239,51 @@ class App:
         self.mqtt.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
         self.mqtt.loop_start()
 
+        discovery_remaining = 0
+        next_discovery_at: float | None = None
+
         try:
             time.sleep(INITIAL_MQTT_SYNC_SECONDS)
             with self.state_lock:
-                self.was_charging = self.is_charging_locked()
                 self.ready = True
-                charging = self.was_charging
-                candidate = self.state[ACTIVE_CANDIDATE_TOPIC]
-                selected_car = self.selected_car_locked()
                 power_w = self.ev_power_w
 
             LOG.info(
-                "Initial MQTT state synced, charging=%s candidate=%s car=%s power=%s",
-                "yes" if charging else "no",
-                candidate or "none",
-                selected_car or "none",
+                "Initial MQTT state synced, power=%s",
                 f"{power_w:.1f} W" if power_w is not None else "unknown",
             )
 
             self.fetch_and_publish("startup")
 
             while True:
-                interval = (
+                normal_interval = (
                     CHARGING_POLL_SECONDS if self.is_charging() else HOURLY_POLL_SECONDS
                 )
+                timeout = normal_interval
+
+                if next_discovery_at is not None:
+                    timeout = min(timeout, max(0.0, next_discovery_at - time.monotonic()))
 
                 try:
-                    reason = self.events.get(timeout=interval)
+                    reason = self.events.get(timeout=timeout)
                 except queue.Empty:
-                    reason = "scheduled_charging" if self.is_charging() else "scheduled_hourly"
+                    if next_discovery_at is not None and time.monotonic() >= next_discovery_at:
+                        reason = "arrival_discovery"
+                    else:
+                        reason = "scheduled_charging" if self.is_charging() else "scheduled_hourly"
 
                 if reason == "charging_stopped":
                     continue
+
+                if reason == "arrived":
+                    discovery_remaining = DISCOVERY_FOLLOWUP_POLLS
+                    next_discovery_at = time.monotonic() + DISCOVERY_POLL_SECONDS
+                elif reason == "arrival_discovery":
+                    discovery_remaining -= 1
+                    if discovery_remaining > 0:
+                        next_discovery_at = time.monotonic() + DISCOVERY_POLL_SECONDS
+                    else:
+                        next_discovery_at = None
 
                 # Collapse duplicate immediate triggers already waiting in the queue.
                 while True:
@@ -269,7 +291,11 @@ class App:
                         pending = self.events.get_nowait()
                     except queue.Empty:
                         break
-                    if pending != "charging_stopped":
+                    if pending == "arrived":
+                        discovery_remaining = DISCOVERY_FOLLOWUP_POLLS
+                        next_discovery_at = time.monotonic() + DISCOVERY_POLL_SECONDS
+                        reason = f"{reason}+arrived"
+                    elif pending != "charging_stopped":
                         reason = f"{reason}+{pending}"
 
                 self.fetch_and_publish(reason)
