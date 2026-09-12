@@ -1,0 +1,16 @@
+[Unit]
+Description=Nissan SoC to MQTT
+Requires=solis-broker.service
+After=solis-broker.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/nissan-soc-mqtt
+EnvironmentFile=/etc/nissan-soc-mqtt.env
+ExecStart=/home/pi/nissan-soc-mqtt/.venv/bin/python /home/pi/nissan-soc-mqtt/nissan_soc_mqtt.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
