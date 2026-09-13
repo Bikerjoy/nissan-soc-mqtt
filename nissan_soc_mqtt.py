@@ -305,6 +305,20 @@ class App:
             status, fresh = self.active_refresh_status()
             charge_status = status.get("chargeStatus")
 
+            if reason == "startup_refresh":
+                if not fresh:
+                    LOG.warning("Startup Nissan refresh did not produce fresh data; keeping retained SoC estimate")
+                    return
+                with self.state_lock:
+                    meter_is_charging = self.meter_charging(self.ev_power_w)
+                    self.mammabim_identified = bool(meter_is_charging and charge_status == 1)
+                self.calibrate_from_status(status, reason)
+                if self.mammabim_identified:
+                    LOG.info("Mammabim identified as charging during service startup")
+                    with self.state_lock:
+                        self.last_effective_battery_power_w = self.effective_battery_power_w(self.ev_power_w)
+                return
+
             if reason.startswith("meter_charging_started"):
                 identified = fresh and charge_status == 1
                 with self.state_lock:
@@ -348,14 +362,15 @@ class App:
                 self.ready = True
                 power_w = self.ev_power_w
                 estimate = self.estimated_soc
-                already_charging = self.meter_charging(power_w)
             LOG.info(
                 "Initial MQTT state synced, power=%s estimated_soc=%s",
                 f"{power_w:.1f} W" if power_w is not None else "unknown",
                 f"{estimate:.2f}%" if estimate is not None else "unknown",
             )
-            if already_charging:
-                self.events.put("meter_charging_started_startup")
+
+            # Always refresh once on service startup so retained SoC cannot remain
+            # stale indefinitely when the car is not charging.
+            self.events.put("startup_refresh")
 
             while True:
                 reason = self.events.get()
