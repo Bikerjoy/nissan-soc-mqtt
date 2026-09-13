@@ -171,6 +171,12 @@ class App:
             self.publish_estimated_soc(publish_soc)
 
         if ready and current_charging and not previous_charging:
+            if identified:
+                LOG.info(
+                    "EV meter charging resumed, power=%.1f W; Mammabim already identified, skipping Nissan refresh",
+                    power_w if power_w is not None else -1.0,
+                )
+                return
             LOG.info(
                 "EV meter charging started, power=%.1f W; actively refreshing Nissan for vehicle identification",
                 power_w if power_w is not None else -1.0,
